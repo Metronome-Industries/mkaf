@@ -2,17 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"unicode"
 
 	"text/tabwriter"
-
-	"encoding/base64"
-	"encoding/hex"
 
 	"sync"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/birdayz/kaf/pkg/streams"
 	"github.com/manifoldco/promptui"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v2"
 
 	"strconv"
 
@@ -34,12 +37,19 @@ var (
 
 	flagNoMembers      bool
 	flagDescribeTopics []string
+
+	flagDumpTopics []string
+	flagDumpOutput string
+
+	// memberId = "-".join(clientIdPrefix, consumerIndex, UUID)
+	groupMemberIDRegex = regexp.MustCompile(`(.*?)-\d+-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
 )
 
 func init() {
 	rootCmd.AddCommand(groupCmd)
 	rootCmd.AddCommand(groupsCmd)
 	groupCmd.AddCommand(groupDescribeCmd)
+	groupCmd.AddCommand(groupDumpCmd)
 	groupCmd.AddCommand(groupLsCmd)
 	groupCmd.AddCommand(groupDeleteCmd)
 	groupCmd.AddCommand(groupPeekCmd)
@@ -55,6 +65,9 @@ func init() {
 
 	groupDescribeCmd.Flags().BoolVar(&flagNoMembers, "no-members", false, "Hide members section of the output")
 	groupDescribeCmd.Flags().StringSliceVarP(&flagDescribeTopics, "topic", "t", []string{}, "topics to display for the group. defaults to all topics.")
+
+	groupDumpCmd.Flags().StringSliceVarP(&flagDumpTopics, "topic", "t", []string{}, "topics to display for the group. defaults to all topics.")
+	groupDumpCmd.Flags().StringVarP(&flagDumpOutput, "output", "o", "human", "output format. Options: human, json, yaml, topicSort")
 }
 
 const (
@@ -595,6 +608,280 @@ var groupDescribeCmd = &cobra.Command{
 
 		w.Flush()
 
+	},
+}
+
+type dumpGroup struct {
+	GroupID string             `json:"group_id"`
+	State   string             `json:"state"`
+	Pods    map[string]dumpPod `json:"pods"`
+}
+
+type dumpPod struct {
+	Name    string                `json:"-"`
+	Members map[string]dumpMember `json:"members"`
+}
+
+type dumpMember struct {
+	ClientID string               `json:"-"`
+	MemberID string               `json:"-"`
+	Pod      string               `json:"-"`
+	Host     string               `json:"-"`
+	Topics   map[string]dumpTopic `json:"topics"`
+}
+
+type dumpTopic struct {
+	Name       string                  `json:"-"`
+	Partitions map[int32]dumpPartition `json:"partitions"`
+}
+
+type dumpPartition struct {
+	Partition     int32   `json:"-"`
+	Offset        int64   `json:"-"`
+	HighWatermark int64   `json:"-"`
+	Lag           int64   `json:"lag"`
+	Leader        int32   `json:"leader"`
+	Isr           []int32 `json:"isr"`
+}
+
+var groupDumpCmd = &cobra.Command{
+	Use:               "dump",
+	Short:             "*Fully* describe consumer group",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: validGroupArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		admin := getClusterAdmin()
+
+		groups, err := admin.DescribeConsumerGroups([]string{args[0]})
+		if err != nil {
+			errorExit("Unable to describe consumer groups: %v\n", err)
+		}
+
+		if len(groups) == 0 {
+			errorExit("Did not receive expected describe consumergroup result\n")
+		}
+		group := groups[0]
+
+		if group.State == "Dead" {
+			fmt.Printf("Group %v not found.\n", args[0])
+			return
+		}
+		fmt.Fprintf(os.Stderr, "pulled consumer group %v...\n", group.GroupId)
+
+		out := dumpGroup{
+			GroupID: group.GroupId,
+			State:   group.State,
+			Pods:    make(map[string]dumpPod),
+		}
+
+		offsetAndMetadata, err := admin.ListConsumerGroupOffsets(args[0], nil)
+		if err != nil {
+			errorExit("Failed to fetch group offsets: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "pulled consumer group offsets...\n")
+
+		topics := make([]string, 0, len(offsetAndMetadata.Blocks))
+		for k := range offsetAndMetadata.Blocks {
+			topics = append(topics, k)
+		}
+		sort.Strings(topics)
+
+		topicDetails, err := admin.DescribeTopics(topics)
+		if err != nil {
+			errorExit("Unable to describe topics: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "pulled topics...\n")
+
+		topicsMetadata := make(map[string]dumpTopic)
+		for _, topicDetail := range topicDetails {
+			if topicDetails[0].Err == sarama.ErrUnknownTopicOrPartition {
+				errorExit("Topic not found: %v\n", topicDetail.Err)
+			}
+
+			pars := make(map[int32]dumpPartition)
+			topic := dumpTopic{
+				Name:       topicDetail.Name,
+				Partitions: pars,
+			}
+
+			partitions := offsetAndMetadata.Blocks[topic.Name]
+			if len(flagDumpTopics) > 0 {
+				var found bool
+				for _, topicToShow := range flagDumpTopics {
+					if topic.Name == topicToShow {
+						found = true
+					}
+				}
+
+				if !found {
+					continue
+				}
+			}
+
+			var p []int32
+
+			for partition := range partitions {
+				p = append(p, partition)
+			}
+
+			sort.Slice(p, func(i, j int) bool {
+				return p[i] < p[j]
+			})
+
+			wms := getHighWatermarks(topic.Name, p)
+			fmt.Fprintf(os.Stderr, "pulled highwater marks...\n")
+
+			lagSum := 0
+			offsetSum := 0
+
+			partitionMap := make(map[int32]*sarama.PartitionMetadata)
+			for _, partition := range topicDetail.Partitions {
+				partitionMap[partition.ID] = partition
+			}
+
+			for _, partition := range p {
+				lag := (wms[partition] - partitions[partition].Offset)
+				lagSum += int(lag)
+				offset := partitions[partition].Offset
+				offsetSum += int(offset)
+
+				topic.Partitions[partition] = dumpPartition{
+					Partition:     partition,
+					Offset:        partitions[partition].Offset,
+					HighWatermark: wms[partition],
+					Lag:           lag,
+					Leader:        partitionMap[partition].Leader,
+					Isr:           partitionMap[partition].Replicas,
+				}
+			}
+
+			topicsMetadata[topic.Name] = topic
+		}
+
+		for _, member := range group.Members {
+			memberIDMatches := groupMemberIDRegex.FindStringSubmatch(member.MemberId)
+			if len(memberIDMatches) > 2 {
+				errorExit("Unexpected member ID: %v\n", memberIDMatches)
+			}
+
+			assignment, err := member.GetMemberAssignment()
+			if err != nil || assignment == nil {
+				continue
+			}
+
+			memberTopics := make(map[string]dumpTopic)
+			for topic, partitions := range assignment.Topics {
+				if _, ok := topicsMetadata[topic]; !ok {
+					continue
+				}
+				memberTopicPartitions := make(map[int32]dumpPartition)
+				for _, partition := range partitions {
+					memberTopicPartitions[partition] = topicsMetadata[topic].Partitions[partition]
+				}
+				memberTopics[topic] = dumpTopic{
+					Name:       topic,
+					Partitions: memberTopicPartitions,
+				}
+			}
+
+			member := dumpMember{
+				ClientID: member.ClientId,
+				MemberID: member.MemberId,
+				Host:     member.ClientHost,
+				Pod:      memberIDMatches[1],
+				Topics:   memberTopics,
+			}
+			if _, ok := out.Pods[member.Pod]; !ok {
+				out.Pods[member.Pod] = dumpPod{
+					Name:    member.Pod,
+					Members: make(map[string]dumpMember),
+				}
+			}
+			out.Pods[member.Pod].Members[member.ClientID] = member
+		}
+		fmt.Fprintf(os.Stderr, "pulled member assignments...\n\n\n")
+
+		switch flagDumpOutput {
+		case "json":
+			jsonOutput, err := json.MarshalIndent(out, "", "  ")
+			if err != nil {
+				errorExit("Failed to marshal output to JSON: %v\n", err)
+			}
+			fmt.Println(string(jsonOutput))
+		case "yaml":
+			yamlOutout, err := yaml.Marshal(out)
+			if err != nil {
+				errorExit("Failed to marshal output to YAML: %v\n", err)
+			}
+			fmt.Println(string(yamlOutout))
+		case "topicSort":
+			type row struct {
+				podName   string
+				clientID  string
+				topicName string
+				partition int32
+				leader    int32
+				isr       []int32
+				lag       int64
+			}
+			var rows []row
+			for _, pod := range out.Pods {
+				for _, member := range pod.Members {
+					for _, topic := range member.Topics {
+						for _, partition := range topic.Partitions {
+							rows = append(rows, row{
+								pod.Name,
+								member.ClientID,
+								topic.Name,
+								partition.Partition,
+								partition.Leader,
+								partition.Isr,
+								partition.Lag,
+							})
+						}
+					}
+				}
+			}
+			sort.Slice(rows, func(i, j int) bool {
+				if rows[i].topicName == rows[j].topicName {
+					return rows[i].partition < rows[j].partition
+				}
+				return rows[i].topicName < rows[j].topicName
+			})
+			w := tabwriter.NewWriter(outWriter, tabwriterMinWidth, tabwriterWidth, tabwriterPadding, tabwriterPadChar, tabwriterFlags)
+			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "Topic", "Partition", "Pod", "ClientID", "Leader", "ISR", "Lag")
+			for _, row := range rows {
+				fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", row.topicName, row.partition, row.podName, row.clientID, row.leader, row.isr, row.lag)
+			}
+			w.Flush()
+
+		default:
+			w := tabwriter.NewWriter(outWriter, tabwriterMinWidth, tabwriterWidth, tabwriterPadding, tabwriterPadChar, tabwriterFlags)
+			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "Pod", "ClientID", "Topic", "Partition", "Leader", "ISR", "Lag")
+			for _, podName := range slices.Sorted(maps.Keys(out.Pods)) {
+				pod := out.Pods[podName]
+				for _, member := range slices.Sorted(maps.Keys(pod.Members)) {
+					member := pod.Members[member]
+					for _, topic := range slices.Sorted(maps.Keys(member.Topics)) {
+						topic := member.Topics[topic]
+						for _, partition := range slices.Sorted(maps.Keys(topic.Partitions)) {
+							partition := topic.Partitions[partition]
+							fmt.Fprintf(w,
+								"%v\t%v\t%v\t%v\t%v\t%v\t%v\n",
+								pod.Name,
+								member.ClientID,
+								topic.Name,
+								partition.Partition,
+								partition.Leader,
+								partition.Isr,
+								partition.Lag,
+							)
+						}
+					}
+				}
+			}
+			w.Flush()
+		}
 	},
 }
 
