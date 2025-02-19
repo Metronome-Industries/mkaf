@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"unicode"
 
 	"text/tabwriter"
@@ -858,7 +859,7 @@ var groupDumpCmd = &cobra.Command{
 		default:
 			w := tabwriter.NewWriter(outWriter, tabwriterMinWidth, tabwriterWidth, tabwriterPadding, tabwriterPadChar, tabwriterFlags)
 			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "Pod", "ClientID", "Topic", "Partition", "Leader", "ISR", "Lag")
-			for _, podName := range slices.Sorted(maps.Keys(out.Pods)) {
+			for _, podName := range slices.SortedFunc(maps.Keys(out.Pods), comparePodsByOrdinal) {
 				pod := out.Pods[podName]
 				for _, member := range slices.Sorted(maps.Keys(pod.Members)) {
 					member := pod.Members[member]
@@ -967,4 +968,19 @@ func tryDecodeUserData(protocol string, raw []byte) (data interface{}, err error
 	default:
 		return nil, errors.New("unknown protocol")
 	}
+}
+
+func comparePodsByOrdinal(i, j string) int {
+	statefulSetPodRegex := regexp.MustCompile(`^(.*)-([0-9]+)$`)
+	iMatches := statefulSetPodRegex.FindStringSubmatch(i)
+	jMatches := statefulSetPodRegex.FindStringSubmatch(j)
+	if len(iMatches) != 3 || len(jMatches) != 3 || strings.ToLower(iMatches[1]) != strings.ToLower(jMatches[1]) {
+		return strings.Compare(strings.ToLower(i), strings.ToLower(j))
+	}
+	iNum, iErr := strconv.Atoi(iMatches[2])
+	jNum, jErr := strconv.Atoi(jMatches[2])
+	if iErr != nil || jErr != nil {
+		return strings.Compare(strings.ToLower(i), strings.ToLower(j))
+	}
+	return iNum - jNum
 }
