@@ -39,8 +39,11 @@ var (
 	flagNoMembers      bool
 	flagDescribeTopics []string
 
-	flagDumpTopics []string
-	flagDumpOutput string
+	flagDumpOutput     string
+	flagDumpSort       string
+	flagDumpTopics     []string
+	flagDumpPartitions []int32
+	flagDumpLeaders    []int32
 
 	// memberId = "-".join(clientIdPrefix, consumerIndex, UUID)
 	groupMemberIDRegex = regexp.MustCompile(`(.*?)-\d+-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
@@ -67,8 +70,11 @@ func init() {
 	groupDescribeCmd.Flags().BoolVar(&flagNoMembers, "no-members", false, "Hide members section of the output")
 	groupDescribeCmd.Flags().StringSliceVarP(&flagDescribeTopics, "topic", "t", []string{}, "topics to display for the group. defaults to all topics.")
 
-	groupDumpCmd.Flags().StringSliceVarP(&flagDumpTopics, "topic", "t", []string{}, "topics to display for the group. defaults to all topics.")
-	groupDumpCmd.Flags().StringVarP(&flagDumpOutput, "output", "o", "human", "output format. Options: human, json, yaml, topicSort")
+	groupDumpCmd.Flags().StringVarP(&flagDumpOutput, "output", "o", "human", "output format. Options: human, json, yaml")
+	groupDumpCmd.Flags().StringVarP(&flagDumpSort, "sort", "s", "lag", "How to sort output. Options: lag, partition, pod, leader")
+	groupDumpCmd.Flags().StringSliceVarP(&flagDumpTopics, "topics", "t", []string{}, "Filter topics (comma separated). Defaults to no filter.")
+	groupDumpCmd.Flags().Int32SliceVarP(&flagDumpPartitions, "partitions", "p", []int32{}, "Filter partitions (comma separated). Defaults to no filter.")
+	groupDumpCmd.Flags().Int32SliceVarP(&flagDumpLeaders, "leaders", "l", []int32{}, "Filter leaders (comma separated). Defaults to no filter.")
 }
 
 const (
@@ -719,16 +725,7 @@ var groupDumpCmd = &cobra.Command{
 				}
 			}
 
-			var p []int32
-
-			for partition := range partitions {
-				p = append(p, partition)
-			}
-
-			sort.Slice(p, func(i, j int) bool {
-				return p[i] < p[j]
-			})
-
+			p := slices.Sorted(maps.Keys(partitions))
 			wms := getHighWatermarks(topic.Name, p)
 			fmt.Fprintf(os.Stderr, "pulled highwater marks...\n")
 
@@ -815,7 +812,7 @@ var groupDumpCmd = &cobra.Command{
 				errorExit("Failed to marshal output to YAML: %v\n", err)
 			}
 			fmt.Println(string(yamlOutout))
-		case "topicSort":
+		default:
 			type row struct {
 				podName   string
 				clientID  string
@@ -824,12 +821,20 @@ var groupDumpCmd = &cobra.Command{
 				leader    int32
 				isr       []int32
 				lag       int64
+				offset    int64
+				hwm       int64
 			}
 			var rows []row
 			for _, pod := range out.Pods {
 				for _, member := range pod.Members {
 					for _, topic := range member.Topics {
 						for _, partition := range topic.Partitions {
+							if len(flagDumpPartitions) > 0 && !slices.Contains(flagDumpPartitions, partition.Partition) {
+								continue
+							}
+							if len(flagDumpLeaders) > 0 && !slices.Contains(flagDumpLeaders, partition.Leader) {
+								continue
+							}
 							rows = append(rows, row{
 								pod.Name,
 								member.ClientID,
@@ -838,48 +843,36 @@ var groupDumpCmd = &cobra.Command{
 								partition.Leader,
 								partition.Isr,
 								partition.Lag,
+								partition.Offset,
+								partition.HighWatermark,
 							})
 						}
 					}
 				}
 			}
-			sort.Slice(rows, func(i, j int) bool {
+			sort.SliceStable(rows, func(i, j int) bool {
 				if rows[i].topicName == rows[j].topicName {
 					return rows[i].partition < rows[j].partition
 				}
 				return rows[i].topicName < rows[j].topicName
 			})
-			w := tabwriter.NewWriter(outWriter, tabwriterMinWidth, tabwriterWidth, tabwriterPadding, tabwriterPadChar, tabwriterFlags)
-			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "Topic", "Partition", "Pod", "ClientID", "Leader", "ISR", "Lag")
-			for _, row := range rows {
-				fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", row.topicName, row.partition, row.podName, row.clientID, row.leader, row.isr, row.lag)
+			if flagDumpSort == "pod" {
+				sort.SliceStable(rows, func(i, j int) bool {
+					return comparePodsByOrdinal(rows[i].podName, rows[j].podName) > 0
+				})
+			} else if flagDumpSort == "lag" {
+				sort.SliceStable(rows, func(i, j int) bool {
+					return rows[i].lag > rows[j].lag
+				})
+			} else if flagDumpSort == "leader" {
+				sort.SliceStable(rows, func(i, j int) bool {
+					return rows[i].leader < rows[j].leader
+				})
 			}
-			w.Flush()
-
-		default:
 			w := tabwriter.NewWriter(outWriter, tabwriterMinWidth, tabwriterWidth, tabwriterPadding, tabwriterPadChar, tabwriterFlags)
-			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "Pod", "ClientID", "Topic", "Partition", "Leader", "ISR", "Lag")
-			for _, podName := range slices.SortedFunc(maps.Keys(out.Pods), comparePodsByOrdinal) {
-				pod := out.Pods[podName]
-				for _, member := range slices.Sorted(maps.Keys(pod.Members)) {
-					member := pod.Members[member]
-					for _, topic := range slices.Sorted(maps.Keys(member.Topics)) {
-						topic := member.Topics[topic]
-						for _, partition := range slices.Sorted(maps.Keys(topic.Partitions)) {
-							partition := topic.Partitions[partition]
-							fmt.Fprintf(w,
-								"%v\t%v\t%v\t%v\t%v\t%v\t%v\n",
-								pod.Name,
-								member.ClientID,
-								topic.Name,
-								partition.Partition,
-								partition.Leader,
-								partition.Isr,
-								partition.Lag,
-							)
-						}
-					}
-				}
+			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "Topic", "Partition", "Pod", "ClientID", "Leader", "ISR", "Lag", "Offset", "HighWaterMark")
+			for _, row := range rows {
+				fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", row.topicName, row.partition, row.podName, row.clientID, row.leader, row.isr, row.lag, row.offset, row.hwm)
 			}
 			w.Flush()
 		}
