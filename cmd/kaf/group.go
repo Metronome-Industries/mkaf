@@ -66,6 +66,7 @@ func init() {
 	groupPeekCmd.Flags().Int32SliceVarP(&flagPeekPartitions, "partitions", "p", []int32{}, "Partitions to peek from")
 	groupPeekCmd.Flags().Int64VarP(&flagPeekBefore, "before", "B", 0, "Number of messages to peek before current offset")
 	groupPeekCmd.Flags().Int64VarP(&flagPeekAfter, "after", "A", 0, "Number of messages to peek after current offset")
+	groupPeekCmd.Flags().VarP(&outputFormat, "output", "o", "Set output format messages: default, raw (without key or prettified JSON), json")
 
 	groupDescribeCmd.Flags().BoolVar(&flagNoMembers, "no-members", false, "Hide members section of the output")
 	groupDescribeCmd.Flags().StringSliceVarP(&flagDescribeTopics, "topic", "t", []string{}, "topics to display for the group. defaults to all topics.")
@@ -381,6 +382,8 @@ var groupPeekCmd = &cobra.Command{
 			fmt.Printf("Group %v not found.\n", args[0])
 			return
 		}
+
+		schemaCache = getSchemaCache()
 
 		peekPartitions := make(map[int32]struct{})
 		for _, partition := range flagPeekPartitions {
